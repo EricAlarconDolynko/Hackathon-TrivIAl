@@ -10,7 +10,7 @@ import json, re
 import os
 try:
     # para producción en Lambda
-    from lambdas.shared.classifier_client import classify_case
+    from artifacts.shared.classifier_client import classify_case
 except Exception:
     # fallback local para dev
     def classify_case(case_json): return []
@@ -893,6 +893,7 @@ def node_habits(state: "AgentState") -> "AgentState":
 # =========================
 # Classifier
 # =========================
+
 def _translate_case_to_en(case_es: Dict[str, Any]) -> Dict[str, Any]:
     """
     Traduce SOLO los valores del JSON a inglés, manteniendo las mismas keys.

@@ -3,7 +3,7 @@ import os
 from types import SimpleNamespace
 
 # Bedrock (default)
-from lambdas.shared.bedrock_client import bedrock_chat
+from artifacts.shared.bedrock_client import bedrock_chat
 
 # (Opcional) Cohere fallback si quieres mantenerlo
 try:
