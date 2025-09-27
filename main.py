@@ -27,7 +27,6 @@ if __name__ == "__main__":
     print("== LangGraph + Cohere (Agente de preconsulta) ==")
     print("Escribe 'exit' para salir.\n")
 
-    # (Opcional) semilla demográfica
     try:
         age_str = input("Edad inicial (opcional): ").strip()
         age = int(age_str) if age_str else None
@@ -50,8 +49,8 @@ if __name__ == "__main__":
         "missing_fields": state.get("missing_fields"),
         "needs_another_symptom": state.get("needs_another_symptom"),
     }
-    print("\n[Estado resumido]")
-    print(pretty(summary))
+    #print("\n[Estado resumido]")
+    #print(pretty(summary))
 
     # --- Loop de conversación (ahora hablas tú) ---
     while True:
