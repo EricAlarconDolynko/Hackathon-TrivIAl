@@ -5,13 +5,19 @@ from langchain.schema import HumanMessage, SystemMessage
 from langchain.prompts import ChatPromptTemplate    
 from .providers import chat_cohere
 from typing import Dict, Any, List, Optional
-import json, re
+import os, json, re
+from urllib import request, error
 
-JUDGE_THRESHOLD = 0.40  
+JUDGE_THRESHOLD = 0.30  
 
 # =========================
 # Estado del Agente
 # =========================
+CLASSIFIER_API_URL = os.getenv(
+    "CLASSIFIER_API_URL",
+    "https://0bzbk63aug.execute-api.us-west-2.amazonaws.com/dev/predict"
+)
+HUGGING_API_KEY = os.getenv("HUGGING_API_KEY")
 
 class Habit(TypedDict, total=False):
     name: str
@@ -886,64 +892,160 @@ def node_habits(state: "AgentState") -> "AgentState":
 # Classifier
 # =========================
 
-def node_classifier(state: "AgentState") -> "AgentState":
+# ==== Helpers para el clasificador externo ====
+
+def _fallback_diffs_from_message(message: Any) -> list[dict]:
     """
-    - Toma el estado actual, arma un JSON de caso (ES), y pide al LLM:
-        * Traducción a EN (case_en)
-        * Top-3 diferenciales con probabilidades
-    - Actualiza state['case_en'], state['differentials'].
-    - Prepara un resumen legible para el usuario (con disclaimer).
-    - Marca classifier_done=True (router lo mandará al siguiente nodo/END).
+    Crea un top-1 diferencial con prob=0.5 a partir de un 'message' no estructurado.
     """
-    new_state: AgentState = dict(state)
+    if isinstance(message, dict):
+        # por si tu endpoint cambia el shape
+        text = str(message.get("message") or message.get("text") or message)
+    else:
+        text = str(message or "")
+    text = text.strip() or "Salida no estructurada del clasificador."
 
-    # 1) Arma el caso (ES) y llama al LLM
-    case_es = _build_patient_case_json_es(state)
-    llm = chat_cohere()
-    msgs = CLASSIFIER_TEMPLATE.format_messages(case_es=json.dumps(case_es, ensure_ascii=False))
-    resp = llm.invoke(msgs).content
+    return [{
+        "condition": "Evaluación preliminar",
+        "probability": 0.5,                 # probabilidad por defecto
+        "rationale": text                   # usamos el texto completo como explicación
+    }]
+    
+def _case_to_question_es(case_es: dict) -> str:
+    """Convierte tu JSON de caso (ES) a un string compacto para el campo 'question'."""
+    parts = []
+    cc = case_es.get("chief_complaint")
+    if cc:
+        parts.append(cc)
 
-    # 2) Parseo tolerante
-    data = _json_from_text(resp) or {}
-    case_en = data.get("case_en") or {}
-    diffs = data.get("differentials") or []
+    syms = case_es.get("symptoms") or []
+    if syms:
+        desc = []
+        for s in syms[:4]:
+            name = (s or {}).get("name") or "síntoma"
+            sev = (s or {}).get("severity") or ""
+            freq = (s or {}).get("frequency") or ""
+            onset = (s or {}).get("onset") or ""
+            chunk = ", ".join([x for x in [name, sev, freq, onset] if x])
+            notes = (s or {}).get("notes")
+            if notes:
+                chunk += f" ({notes})"
+            desc.append(chunk)
+        parts.append("Síntomas: " + "; ".join(desc))
 
-    # Normaliza diferenciales (top-3)
-    cleaned_diffs = []
-    for d in diffs[:3]:
+    ph = case_es.get("personal_history")
+    if ph:
+        parts.append(f"Antecedentes personales: {ph}")
+    fh = case_es.get("family_history")
+    if fh:
+        parts.append(f"Antecedentes familiares: {fh}")
+
+    demo = []
+    age = case_es.get("age")
+    nat = case_es.get("nationality")
+    if age is not None:
+        demo.append(f"{age} años")
+    if nat:
+        demo.append(nat)
+    if demo:
+        parts.append("Demografía: " + ", ".join(demo))
+
+    text = ". ".join(p for p in parts if p)
+    return text or "Caso clínico breve para clasificación."
+
+def _post_classifier(question: str) -> dict:
+    """POST {question: "..."} a tu endpoint. Incluye API key si está definida."""
+    payload = json.dumps({"question": question}).encode("utf-8")
+    req = request.Request(CLASSIFIER_API_URL, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+
+    # Compatibilidad con API Gateway API Key o bearer
+    if HUGGING_API_KEY:
+        req.add_header("x-api-key", HUGGING_API_KEY)
+        req.add_header("Authorization", f"Bearer {HUGGING_API_KEY}")
+
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except error.HTTPError as e:
+        body = e.read().decode("utf-8") if e.fp else ""
+        raise RuntimeError(f"Classifier HTTP {e.code}: {body}")
+    except error.URLError as e:
+        raise RuntimeError(f"Classifier connection error: {getattr(e, 'reason', str(e))}")
+    except Exception as e:
+        raise RuntimeError(f"Classifier unknown error: {str(e)}")
+
+def _normalize_differentials(obj: object) -> list[dict]:
+    """
+    Acepta múltiples posibles formas de respuesta y devuelve:
+    [{"condition": str, "probability": float, "rationale": str}][:3]
+    """
+    diffs_src = []
+    if isinstance(obj, dict):
+        for k in ("differentials", "results", "data"):
+            if isinstance(obj.get(k), list):
+                diffs_src = obj[k]
+                break
+        if not diffs_src:
+            # si vino algo como {"text": "..."} intenta parsear listas simples
+            text = obj.get("text") or obj.get("message") or ""
+            if isinstance(text, str):
+                # intento básico de parseo: "- Dx (0.42): razón"
+                items = re.findall(r"[-•]\s*(.+?)\s*\(([\d.]+)\)\s*:\s*(.+)", text)
+                diffs_src = [{"condition": a.strip(), "probability": float(b), "rationale": c.strip()} for a, b, c in items]
+    elif isinstance(obj, list):
+        diffs_src = obj
+
+    out = []
+    for d in (diffs_src or []):
         try:
-            cleaned_diffs.append({
-                "condition": str(d.get("condition", "")).strip(),
-                "probability": float(d.get("probability", 0.0)),
-                "rationale": str(d.get("rationale", "")).strip(),
-            })
+            cond = str(d.get("condition", "")).strip()
+            prob = float(d.get("probability", 0.0))
+            rat = str(d.get("rationale", "")).strip()
+            if not cond:
+                continue
+            if prob < 0.0: prob = 0.0
+            if prob > 1.0: prob = 1.0
+            out.append({"condition": cond, "probability": prob, "rationale": rat})
         except Exception:
             continue
+        if len(out) >= 3:
+            break
+    return out
 
-    new_state["case_en"] = case_en
-    new_state["differentials"] = cleaned_diffs
+
+# ==== Reemplazo completo del nodo ====
+
+def node_classifier(state: "AgentState") -> "AgentState":
+    new_state: AgentState = dict(state)
+
+    # 1) Caso ES → string 'question'
+    case_es = _build_patient_case_json_es(state)
+    question = _case_to_question_es(case_es)
+
+    # 2) Llamar API externa
+    try:
+        api_resp = _post_classifier(question)
+    except Exception as e:
+        api_resp = {"message": f"error: {e}"}
+        new_state["classifier_error"] = str(e)
+
+    # 3) Intento normalizar (por si algún día tu API devuelve listas)
+    diffs = _normalize_differentials(api_resp)
+
+    # 4) Fallback SIMPLE: si no hay nada, crea 1 diferencial con 50%
+    if not diffs:
+        msg = api_resp.get("message") if isinstance(api_resp, dict) else api_resp
+        diffs = _fallback_diffs_from_message(msg)
+
+    # 5) Guardar y ceder al juez (no hablar aquí)
+    new_state["differentials"] = diffs
     new_state["classifier_done"] = True
-    new_state["classifier_route"] = "to_end"  # cuando agregues 'judge', cambia a 'to_judge'
-
-    # 3) Mensaje para el usuario (sin JSON, breve + disclaimer)
-    if cleaned_diffs:
-        lines = [f"- {d['condition']}: {round(d['probability']*100, 1)}% — {d['rationale']}" for d in cleaned_diffs]
-        summary = "Posibles causas (no es diagnóstico):\n" + "\n".join(lines)
-    else:
-        summary = "He generado un resumen del caso. Aún no tengo un diferencial claro."
-
-    disclaimer = "\n\nNota: Esto NO es un diagnóstico médico. Si presentas síntomas intensos o alarmantes, busca atención profesional."
-
-    new_state["conversation_response"] = summary + disclaimer
-
-    # (opcional) compacta algo de contexto
-    prev_ctx = state.get("conversation_context") or ""
-    new_ctx = (prev_ctx + ("\n" if prev_ctx else "") + summary).strip()
-    if len(new_ctx) > 1400:
-        new_ctx = new_ctx[-1400:]
-    new_state["conversation_context"] = new_ctx
+    new_state["case_en"] = new_state.get("case_en", {})  # si lo usas en output, mantenlo
 
     return new_state
+
 
 
 # =========================

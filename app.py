@@ -8,7 +8,7 @@ load_dotenv()
 
 from agent.graph import build_graph  # usamos el grafo directamente para mantener estado por turnos:contentReference[oaicite:4]{index=4}
 
-st.set_page_config(page_title="🩺 Preconsulta IA", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="🩺 Hackhaton TrivIAl centro médico", page_icon="🩺", layout="centered")
 
 # --- Chequeo de API Key (evita ValueError en providers.py si falta):contentReference[oaicite:5]{index=5}---
 if not os.getenv("COHERE_API_KEY"):
