@@ -70,8 +70,11 @@ class AgentState(TypedDict, total=False):
     conv_route: Literal["ask_user", "to_symptom", "to_habits"]  # puedes usar sólo ask_user / to_habits si prefieres
     symptom_done: bool
     symptom_route: Literal["ask_user", "to_habits"]
+    habits_done: bool
+    habits_route: Literal["to_habits, to_classifier"]
     classifier_done: bool
     classifier_route: Literal["to_end", "to_judge"]
+    
     
 # =========================
 # Prompt Templates
@@ -159,32 +162,32 @@ clear ENGLISH JSON and produce a calibrated differential diagnosis (top-3). Do N
 Return ONLY JSON with the exact schema below.
 
 Schema (JSON):
-{
-  "case_en": {
+{{
+  "case_en": {{
     "age": number|null,
     "nationality": "string|null",
     "chief_complaint": "string|null",
     "symptoms": [
-      {
+      {{
         "name": "string|null",
         "severity": "mild|moderate|severe|null",
         "frequency": "string|null",
         "onset": "string|null",
         "notes": "string|null"
-      }
+      }}
     ],
     "personal_history": "string|null",
     "family_history": "string|null",
     "habits": [
-      {"name": "string", "regularity": "string|null"}
+      {{"name": "string", "regularity": "string|null"}}
     ]
-  },
+  }},
   "differentials": [
-    {"condition": "string", "probability": 0.0, "rationale": "string"},
-    {"condition": "string", "probability": 0.0, "rationale": "string"},
-    {"condition": "string", "probability": 0.0, "rationale": "string"}
+    {{"condition": "string", "probability": 0.0, "rationale": "string"}},
+    {{"condition": "string", "probability": 0.0, "rationale": "string"}},
+    {{"condition": "string", "probability": 0.0, "rationale": "string"}}
   ]
-}
+}}
 
 Constraints:
 - Translate content to ENGLISH in "case_en".
@@ -760,8 +763,9 @@ def node_habits(state: "AgentState") -> "AgentState":
     - Propone hábitos relevantes según los síntomas.
     - Asegura entradas en state['habits'] con regularidad=None.
     - Si hay 'last_asked_habit_slot', intenta llenar con la respuesta del usuario
-      (o con 'No hay conocimiento...' si dice 'no sé').
-    - Formula 1a2 preguntas pendientes y redacta con el prompt template.
+      (o con _NO_INFO_TEXT si dice 'no sé' o no aporta).
+    - Formula **1** pregunta pendiente y redacta con el prompt template.
+    - Si ya no hay pendientes, no emite texto y deja listo el handoff al clasificador.
     """
     new_state: AgentState = dict(state)
     user_text = state.get("user_input") or ""
@@ -775,6 +779,7 @@ def node_habits(state: "AgentState") -> "AgentState":
         elif user_text.strip():
             _set_habit_slot_value(new_state, last_h_slot, user_text.strip())
             new_state["last_asked_habit_slot"] = None
+        # si el usuario no dijo nada útil, dejamos el slot para volver a preguntarlo más adelante
 
     # 2) Sugerir hábitos a partir de síntomas (solo una vez)
     if not new_state.get("habits_suggested"):
@@ -791,31 +796,105 @@ def node_habits(state: "AgentState") -> "AgentState":
     # 3) Asegurar entradas en 'habits'
     _ensure_habits_initialized(new_state, suggested)
 
-    # 4) Recalcular pendientes y preguntas
+    # 4) Recalcular pendientes
     pending = _compute_pending_habit_slots(new_state)
     new_state["pending_habit_slots"] = pending
     new_state["missing_habits_fields"] = [f"{s['field']}: {s['habit_name']}" for s in pending]
 
-    prev_text = (new_state.get("conversation_response") or "").strip()
     age = new_state.get("age")
     nationality = new_state.get("nationality")
     context = new_state.get("conversation_context")
 
+    # 5) Si no hay pendientes: NO hablar y rutear al clasificador
     if not pending:
-        # Nada pendiente: cierre amable
-        pretty = _render_habits_text(age, nationality, context, intro, ["He registrado tus hábitos principales."])
-        new_state["conversation_response"] = (prev_text + ("\n\n" if prev_text else "") + pretty).strip()
+        new_state["habits_done"] = True
+        new_state["habits_route"] = "to_classifier"
+        # no escribir conversation_response para evitar dos voces;
+        # el clasificador hablará en este mismo invoke
         return new_state
 
-    # 5) Preguntar 1–2 pendientes
-    to_ask = pending[:1]
-    qs = [_question_for_habit_slot(s) for s in to_ask]
-    new_state["last_asked_habit_slot"] = to_ask[0]
+    # 6) Preguntar exactamente 1 pendiente
+    slot = pending[0]
+    q = _question_for_habit_slot(slot)
+    new_state["last_asked_habit_slot"] = slot
 
-    pretty = _render_habits_text(age, nationality, context, intro, qs)
-    new_state["conversation_response"] = (prev_text + ("\n\n" if prev_text else "") + pretty).strip()
+    pretty = _render_habits_text(age, nationality, context, intro, [q])
+
+    # **Sobrescribe** la respuesta (no concatenes texto previo)
+    new_state["conversation_response"] = pretty
+
+    # (opcional) Actualizar contexto compacto
+    prev_ctx = new_state.get("conversation_context") or ""
+    new_ctx = (prev_ctx + ("\n" if prev_ctx else "") + pretty).strip()
+    if len(new_ctx) > 1400:
+        new_ctx = new_ctx[-1400:]
+    new_state["conversation_context"] = new_ctx
 
     return new_state
+
+# =========================
+# Classifier
+# =========================
+
+def node_classifier(state: "AgentState") -> "AgentState":
+    """
+    - Toma el estado actual, arma un JSON de caso (ES), y pide al LLM:
+        * Traducción a EN (case_en)
+        * Top-3 diferenciales con probabilidades
+    - Actualiza state['case_en'], state['differentials'].
+    - Prepara un resumen legible para el usuario (con disclaimer).
+    - Marca classifier_done=True (router lo mandará al siguiente nodo/END).
+    """
+    new_state: AgentState = dict(state)
+
+    # 1) Arma el caso (ES) y llama al LLM
+    case_es = _build_patient_case_json_es(state)
+    llm = chat_cohere()
+    msgs = CLASSIFIER_TEMPLATE.format_messages(case_es=json.dumps(case_es, ensure_ascii=False))
+    resp = llm.invoke(msgs).content
+
+    # 2) Parseo tolerante
+    data = _json_from_text(resp) or {}
+    case_en = data.get("case_en") or {}
+    diffs = data.get("differentials") or []
+
+    # Normaliza diferenciales (top-3)
+    cleaned_diffs = []
+    for d in diffs[:3]:
+        try:
+            cleaned_diffs.append({
+                "condition": str(d.get("condition", "")).strip(),
+                "probability": float(d.get("probability", 0.0)),
+                "rationale": str(d.get("rationale", "")).strip(),
+            })
+        except Exception:
+            continue
+
+    new_state["case_en"] = case_en
+    new_state["differentials"] = cleaned_diffs
+    new_state["classifier_done"] = True
+    new_state["classifier_route"] = "to_end"  # cuando agregues 'judge', cambia a 'to_judge'
+
+    # 3) Mensaje para el usuario (sin JSON, breve + disclaimer)
+    if cleaned_diffs:
+        lines = [f"- {d['condition']}: {round(d['probability']*100, 1)}% — {d['rationale']}" for d in cleaned_diffs]
+        summary = "Posibles causas (no es diagnóstico):\n" + "\n".join(lines)
+    else:
+        summary = "He generado un resumen del caso. Aún no tengo un diferencial claro."
+
+    disclaimer = "\n\nNota: Esto NO es un diagnóstico médico. Si presentas síntomas intensos o alarmantes, busca atención profesional."
+
+    new_state["conversation_response"] = summary + disclaimer
+
+    # (opcional) compacta algo de contexto
+    prev_ctx = state.get("conversation_context") or ""
+    new_ctx = (prev_ctx + ("\n" if prev_ctx else "") + summary).strip()
+    if len(new_ctx) > 1400:
+        new_ctx = new_ctx[-1400:]
+    new_state["conversation_context"] = new_ctx
+
+    return new_state
+
 
 # =========================
 # Router
@@ -832,13 +911,13 @@ def route_from_symptom(state) -> Literal["ask_user", "to_habits"]:
     pending = state.get("pending_slots") or []
     return "to_habits" if len(pending) == 0 else "ask_user"
 
-def route_from_habits(state) -> Literal["ask_user", "to_end"]:
-    """
-    Si ya no hay pendientes de hábitos (pending_habit_slots vacío), terminamos.
-    Si faltan, pedimos respuesta del usuario.
-    """
+def route_from_habits(state) -> Literal["ask_user", "to_classifier"]:
     pending_h = state.get("pending_habit_slots") or []
-    return "to_end" if len(pending_h) == 0 else "ask_user"
+    return "to_classifier" if len(pending_h) == 0 else "ask_user"
+
+def route_from_classifier(state) -> Literal["to_end"]:
+    return "to_end"
+
 
 # =========================
 # Grafo minimal y runner
@@ -846,35 +925,32 @@ def route_from_habits(state) -> Literal["ask_user", "to_end"]:
 def build_graph():
     g = StateGraph(AgentState)
 
-    # Nodos que ya tienes implementados
     g.add_node("conversational", node_conversational)
     g.add_node("symptom", node_symptom_validator)
     g.add_node("habits", node_habits)
-    
+    g.add_node("classifier", node_classifier)  # << nuevo
+
     g.set_entry_point("conversational")
+
     g.add_conditional_edges(
         "conversational",
         route_from_conversational,
-        {
-            "ask_user": END,
-            "to_symptom": "symptom",
-        },
+        {"ask_user": END, "to_symptom": "symptom"},
     )
     g.add_conditional_edges(
         "symptom",
         route_from_symptom,
-        {
-            "ask_user": END,
-            "to_habits": "habits",
-        },
+        {"ask_user": END, "to_habits": "habits"},
     )
     g.add_conditional_edges(
         "habits",
         route_from_habits,
-        {
-            "ask_user": END,
-            "to_end": END,
-        },
+        {"ask_user": END, "to_classifier": "classifier"},
+    )
+    g.add_conditional_edges(
+        "classifier",
+        route_from_classifier,
+        {"to_end": END},
     )
 
     return g.compile()
