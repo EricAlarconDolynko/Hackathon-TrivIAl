@@ -1,0 +1,10 @@
+langchain
+langchain-cohere
+langgraph
+langchain-aws
+langchain-community>=0.3
+boto3
+botocore
+pydantic
+huggingface-hub
+python-dotenv
