@@ -7,7 +7,7 @@ from .providers import chat_cohere
 from typing import Dict, Any, List, Optional
 import json, re
 
-JUDGE_THRESHOLD = 0.50  
+JUDGE_THRESHOLD = 0.40  
 
 # =========================
 # Estado del Agente
@@ -973,7 +973,7 @@ def node_judge(state: "AgentState") -> "AgentState":
         if p > max_prob:
             max_prob = p
 
-    if passes >= 3:
+    if passes >= 2:
         decision = "to_output"
     elif max_prob >= JUDGE_THRESHOLD:
         decision = "to_output"
