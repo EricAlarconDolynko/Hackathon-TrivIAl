@@ -893,6 +893,28 @@ def node_habits(state: "AgentState") -> "AgentState":
 # =========================
 # Classifier
 # =========================
+def _translate_case_to_en(case_es: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Traduce SOLO los valores del JSON a inglés, manteniendo las mismas keys.
+    """
+    llm = chat_llm()
+    from langchain.prompts import ChatPromptTemplate
+    TR_SYS = "You translate Spanish JSON values to clear English, preserving keys. Return ONLY JSON."
+    TR_TMPL = ChatPromptTemplate.from_messages([
+        ("system", TR_SYS),
+        ("human", "SPANISH JSON:\n{blob}\n\nReturn only JSON.")
+    ])
+    import json as _json
+    msgs = TR_TMPL.format_messages(blob=_json.dumps(case_es, ensure_ascii=False))
+    try:
+        out = llm.invoke(msgs).content
+        # parse tolerante
+        import re, json
+        m = re.search(r"\{.*\}", out, flags=re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
+    except Exception:
+        return {}
+
 
 def node_classifier(state: "AgentState") -> "AgentState":
     """
