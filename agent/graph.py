@@ -7,6 +7,8 @@ from .providers import chat_cohere
 from typing import Dict, Any, List, Optional
 import json, re
 
+JUDGE_THRESHOLD = 0.80  
+
 # =========================
 # Estado del Agente
 # =========================
@@ -65,6 +67,13 @@ class AgentState(TypedDict, total=False):
     case_en: Dict[str, Any]                 # JSON del caso en inglés (normalizado)
     differentials: List[Differential]       # top-3 diferenciales
 
+    judge_passes: int
+    judge_route: Literal["to_output", "to_additional"]
+    judge_decision: Literal["to_output", "to_additional"]
+    
+    additional_questions: List[Dict[str, Any]]     # [{"q": str, "answer": Optional[str], "asked": bool}]
+    last_asked_additional: Optional[int]           # índice de la pregunta en curso
+    
     # Señal del conversacional para ruteo
     conv_done: bool
     conv_route: Literal["ask_user", "to_symptom", "to_habits"]  # puedes usar sólo ask_user / to_habits si prefieres
@@ -74,8 +83,10 @@ class AgentState(TypedDict, total=False):
     habits_route: Literal["to_habits, to_classifier"]
     classifier_done: bool
     classifier_route: Literal["to_end", "to_judge"]
+    additional_done: bool
+    additional_route: Literal["ask_user", "to_classifier"]
     
-    
+
 # =========================
 # Prompt Templates
 # =========================
@@ -200,6 +211,45 @@ CLASSIFIER_TEMPLATE = ChatPromptTemplate.from_messages([
     ("human",
      "SPANISH CASE JSON:\n{case_es}\n\n"
      "Return ONLY the JSON following the schema. No extra text.")
+])
+
+ADDITIONAL_SYSTEM = """Eres un asistente de salud. Recibes un caso clínico resumido y un top-3 de
+diagnósticos diferenciales. Tu tarea: proponer EXACTAMENTE 3 preguntas cortas, claras y clínicas
+(en español) que ayuden a diferenciar entre esas opciones. No des explicaciones, no menciones
+diagnósticos en las preguntas, no sugieras tratamientos. Devuelve sólo una lista simple con viñetas."""
+
+ADDITIONAL_TEMPLATE = ChatPromptTemplate.from_messages([
+    ("system", ADDITIONAL_SYSTEM),
+    ("human",
+     "CASO (resumen JSON en español): {case_es}\n\n"
+     "DIFERENCIALES (máx 3): {diffs}\n\n"
+     "Devuelve únicamente 3 líneas, cada una iniciando con '- ' y la pregunta.")
+])
+
+OUTPUT_SYSTEM = """Eres un asistente de salud para preconsulta.
+Escribe en ESPAÑOL un mensaje breve, claro y empático para el/la paciente.
+No diagnostiques ni indiques tratamientos específicos. No uses jerga técnica innecesaria.
+Estructura:
+1) Encabezado con la opción MÁS PROBABLE (condición) y su probabilidad en %.
+   - Resume en 2 a 3 frases por qué podría encajar con el caso (usa el caso en inglés como referencia).
+   - Indica pasos generales y seguros: autocuidado, señales de alarma y cuándo acudir a un profesional.
+2) Otras posibilidades: lista con las otras 2 condiciones (solo nombre + 1 línea de contexto).
+3) Mensaje ético final: deja claro que esto es apoyo con IA, que no reemplaza evaluación clínica,
+   y que, si hay empeoramiento o señales de alarma, debe buscar atención.
+
+No incluyas JSON ni tablas. Sé amable y directo/a.
+"""
+
+OUTPUT_TEMPLATE = ChatPromptTemplate.from_messages([
+    ("system", OUTPUT_SYSTEM),
+    ("human",
+     "CASE (EN JSON): {case_en}\n\n"
+     "TOP1: {top1}\n"
+     "TOP1_PROB: {top1_prob_percent}%\n"
+     "TOP1_RATIONALE: {top1_rationale}\n\n"
+     "OTHERS: {others}\n\n"
+     "Redacta el mensaje final siguiendo la estructura indicada. "
+     "No incluyas nada más que el texto para el/la paciente.")
 ])
 
 # =========================
@@ -897,6 +947,252 @@ def node_classifier(state: "AgentState") -> "AgentState":
 
 
 # =========================
+# Judge
+# =========================
+
+def node_judge(state: "AgentState") -> "AgentState":
+    """
+    - Si alguna prob >= 0.80 => to_output
+    - Si no, => to_additional
+    - Conteo de vistas del juez; en la 3ra vez => to_output sí o sí.
+    - NO emite texto (no toca conversation_response).
+    """
+    new_state: AgentState = dict(state)
+
+    # Incrementa contador
+    passes = int(new_state.get("judge_passes") or 0) + 1
+    new_state["judge_passes"] = passes
+
+    diffs = new_state.get("differentials") or []
+    max_prob = 0.0
+    for d in diffs:
+        try:
+            p = float(d.get("probability", 0.0))
+        except Exception:
+            p = 0.0
+        if p > max_prob:
+            max_prob = p
+
+    if passes >= 2:
+        decision = "to_output"
+    elif max_prob >= JUDGE_THRESHOLD:
+        decision = "to_output"
+    else:
+        decision = "to_additional"
+
+    new_state["judge_decision"] = decision
+    new_state["judge_route"] = decision
+    # Importante: no tocar conversation_response ni context para evitar "dos voces"
+    return new_state
+
+# =========================
+# Aditional
+# =========================
+
+def _render_additional_questions(case_es: dict, diffs: List[Dict[str, Any]]) -> List[str]:
+    """Pide al LLM 3 preguntas discriminantes y las parsea como lista de strings."""
+    llm = chat_cohere()
+    difflist = ", ".join([str(d.get("condition","")).strip() for d in diffs[:3] if d.get("condition")])
+    msgs = ADDITIONAL_TEMPLATE.format_messages(
+        case_es=json.dumps(case_es, ensure_ascii=False),
+        diffs=difflist or "(sin diferenciales)"
+    )
+    try:
+        txt = llm.invoke(msgs).content
+    except Exception:
+        # Fallback muy simple si hay error/ratelimit
+        return [
+            "¿Has tenido fiebre recientemente?",
+            "¿El dolor empeora al presionar o al moverte?",
+            "¿Has notado cambios en tus deposiciones (sangre, diarrea o estreñimiento)?",
+        ]
+    # Parseo por líneas con '- '
+    qs = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("-"):
+            line = line[1:].strip()
+        # limpieza menor
+        line = re.sub(r"\s{2,}", " ", line)
+        if line:
+            qs.append(line)
+        if len(qs) == 3:
+            break
+    # asegurar 3
+    while len(qs) < 3:
+        qs.append("¿Puedes aportar un detalle adicional que ayude a diferenciar la causa?")
+    return qs
+
+def _store_additional_as_symptom(state: "AgentState", question: str, answer: str):
+    """Guarda la respuesta como un nuevo 'síntoma' con la respuesta en 'notes'."""
+    symptoms = state.get("symptoms") or []
+    entry = {
+        "name": f"Pregunta adicional: {question[:60]}",
+        "severity": None,
+        "frequency": None,
+        "onset": None,
+        "notes": answer.strip() if answer else "No hay conocimiento sobre este aspecto",
+    }
+    symptoms.append(entry)
+    state["symptoms"] = symptoms
+
+def _is_no_info_answer(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(x in t for x in ("no se","no sé","no recuerdo","n/a","no aplica","ninguno","ninguna"))
+
+def node_additional(state: "AgentState") -> "AgentState":
+    """
+    - Si no existen 'additional_questions', genera 3 con LLM (según diferenciales y caso).
+    - 1 pregunta por turno: si había una en curso, interpreta la respuesta y la guarda como 'síntoma'.
+    - Si aún quedan preguntas sin responder, pregunta la siguiente y termina el turno.
+    - Si todas están respondidas: no emite texto y rutea a 'classifier'.
+    """
+    new_state: AgentState = dict(state)
+    user_text = state.get("user_input") or ""
+
+    # 0) Si no hay lista de preguntas, generarla
+    if not new_state.get("additional_questions"):
+        case_es = _build_patient_case_json_es(state)
+        diffs = state.get("differentials") or []
+        qs = _render_additional_questions(case_es, diffs)
+        new_state["additional_questions"] = [{"q": q, "answer": None, "asked": False} for q in qs]
+        new_state["last_asked_additional"] = None
+
+    # 1) Si había una pregunta en curso, registrar respuesta
+    last_idx = new_state.get("last_asked_additional")
+    if last_idx is not None:
+        answer = None
+        if _is_no_info_answer(user_text):
+            answer = "No hay conocimiento sobre este aspecto"
+        elif user_text.strip():
+            answer = user_text.strip()
+        # Si el usuario no dijo nada útil, dejamos el slot sin contestar y no avanzamos
+        if answer is not None:
+            new_state["additional_questions"][last_idx]["answer"] = answer
+            new_state["additional_questions"][last_idx]["asked"] = True
+            new_state["last_asked_additional"] = None
+            # Guardar como síntoma
+            _store_additional_as_symptom(new_state, new_state["additional_questions"][last_idx]["q"], answer)
+
+    # 2) Buscar la siguiente pregunta pendiente (sin answer)
+    next_idx = None
+    for i, q in enumerate(new_state.get("additional_questions") or []):
+        if not q.get("answer"):
+            next_idx = i
+            break
+
+    # 3) Si ya completamos las 3 -> handoff a classifier (sin hablar)
+    if next_idx is None:
+        new_state["additional_done"] = True
+        new_state["additional_route"] = "to_classifier"
+        # No escribir conversation_response para evitar "doble voz"; el classifier hablará
+        return new_state
+
+    # 4) Hacer exactamente 1 pregunta (la siguiente pendiente)
+    qtext = new_state["additional_questions"][next_idx]["q"]
+    new_state["last_asked_additional"] = next_idx
+    # Redacción final mínima (sin LLM extra)
+    pretty = f"{qtext} Si no sabes o no aplica, puedes decir “no sé”."
+    new_state["conversation_response"] = pretty
+
+    # (opcional) Contexto compacto
+    prev_ctx = new_state.get("conversation_context") or ""
+    new_ctx = (prev_ctx + ("\n" if prev_ctx else "") + pretty).strip()
+    if len(new_ctx) > 1400:
+        new_ctx = new_ctx[-1400:]
+    new_state["conversation_context"] = new_ctx
+
+    return new_state
+
+# =========================
+# Output 
+# =========================
+
+def _render_output_text(case_en: dict, diffs: list) -> str:
+    llm = chat_cohere()
+    # preparar datos
+    d0 = diffs[0]
+    top1 = (d0.get("condition") or "").strip()
+    p1 = float(d0.get("probability") or 0.0) * 100.0
+    r1 = (d0.get("rationale") or "").strip()
+    others = []
+    for d in diffs[1:3]:
+        name = (d.get("condition") or "").strip()
+        if not name: 
+            continue
+        pr = float(d.get("probability") or 0.0) * 100.0
+        rr = (d.get("rationale") or "").strip()
+        others.append(f"{name} (~{round(pr,1)}%): {rr}")
+    others_text = "; ".join(others) if others else "(sin alternativas)"
+
+    msgs = OUTPUT_TEMPLATE.format_messages(
+        case_en=json.dumps(case_en, ensure_ascii=False),
+        top1=top1 or "(desconocido)",
+        top1_prob_percent=round(p1, 1),
+        top1_rationale=r1 or "(sin detalle)",
+        others=others_text
+    )
+    try:
+        return llm.invoke(msgs).content
+    except Exception:
+        # Fallback determinista mínimo
+        lines = [f"Opción más probable: {top1 or 'Desconocida'} (≈{round(p1,1)}%)."]
+        if r1:
+            lines.append(f"Por qué podría encajar: {r1}")
+        if others:
+            lines.append("Otras posibilidades: " + "; ".join(o.split(":")[0] for o in others))
+        lines.append(
+            "Esto NO es un diagnóstico. Si presentas señales de alarma (dolor intenso, fiebre alta, vómitos persistentes, "
+            "sangrado, dificultad para respirar, desmayo) o empeoras, busca atención profesional."
+        )
+        return "\n\n".join(lines)
+    
+# ==== Nodo: OutputConversation ====
+def node_output(state: "AgentState") -> "AgentState":
+    """
+    - Toma case_en y differentials (top-3) y produce un mensaje final en español.
+    - No pregunta nada. Sobrescribe conversation_response.
+    - Señaliza que terminó.
+    """
+    new_state: AgentState = dict(state)
+
+    diffs = new_state.get("differentials") or []
+    if not diffs:
+        new_state["conversation_response"] = (
+            "Aún no tengo suficiente información para proponer posibilidades con confianza. "
+            "Podemos revisar tus síntomas y hábitos nuevamente."
+        )
+        new_state["output_done"] = True
+        return new_state
+
+    # ordenar por prob (por si acaso)
+    diffs_sorted = sorted(
+        [d for d in diffs if d.get("condition")],
+        key=lambda x: float(x.get("probability", 0.0)),
+        reverse=True
+    )
+    case_en = new_state.get("case_en") or {}
+
+    # Renderizar texto final (Cohere + fallback)
+    text = _render_output_text(case_en, diffs_sorted)
+
+    # Sobrescribir salida visible (no concatenar)
+    new_state["conversation_response"] = text
+    new_state["output_done"] = True
+
+    # (opcional) actualizar contexto compacto
+    prev_ctx = new_state.get("conversation_context") or ""
+    new_ctx = (prev_ctx + ("\n" if prev_ctx else "") + text).strip()
+    if len(new_ctx) > 1400:
+        new_ctx = new_ctx[-1400:]
+    new_state["conversation_context"] = new_ctx
+
+    return new_state
+
+
+# =========================
 # Router
 # =========================
 
@@ -915,8 +1211,17 @@ def route_from_habits(state) -> Literal["ask_user", "to_classifier"]:
     pending_h = state.get("pending_habit_slots") or []
     return "to_classifier" if len(pending_h) == 0 else "ask_user"
 
-def route_from_classifier(state) -> Literal["to_end"]:
-    return "to_end"
+def route_from_classifier(state) -> Literal["to_judge"]:
+    # el clasificador siempre pasa por el juez
+    return "to_judge"
+
+def route_from_judge(state) -> Literal["to_output", "to_additional"]:
+    # el nodo juez ya escribió la decisión en el estado
+    return state.get("judge_route", "to_additional")
+
+def route_from_additional(state) -> Literal["ask_user", "to_classifier"]:
+    pending = [q for q in (state.get("additional_questions") or []) if not q.get("answer")]
+    return "to_classifier" if len(pending) == 0 else "ask_user"
 
 
 # =========================
@@ -928,8 +1233,11 @@ def build_graph():
     g.add_node("conversational", node_conversational)
     g.add_node("symptom", node_symptom_validator)
     g.add_node("habits", node_habits)
-    g.add_node("classifier", node_classifier)  # << nuevo
-
+    g.add_node("classifier", node_classifier)
+    g.add_node("judge", node_judge)  # ← nuevo
+    g.add_node("additional", node_additional)
+    g.add_node("output", node_output)
+    
     g.set_entry_point("conversational")
 
     g.add_conditional_edges(
@@ -947,13 +1255,37 @@ def build_graph():
         route_from_habits,
         {"ask_user": END, "to_classifier": "classifier"},
     )
+
+    # classifier -> judge
     g.add_conditional_edges(
         "classifier",
         route_from_classifier,
-        {"to_end": END},
+        {"to_judge": "judge"},
     )
 
+    
+    g.add_conditional_edges(
+    "judge",
+    route_from_judge,
+    {
+        "to_output": "output",
+        "to_additional": "additional",
+    },
+    )
+    
+    g.add_conditional_edges(
+    "additional",
+    route_from_additional,
+    {
+        "ask_user": END,
+        "to_classifier": "classifier",
+    },
+    )
+    
+    g.add_edge("output", END)
+
     return g.compile()
+
 
 _app = build_graph()
 
